@@ -28,6 +28,10 @@ Return ONLY the patch operations needed to keep the list accurate:
 
 Always include the quantity inside 'text' when there is one (like "Buy 7 cups").`;
 
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function generateVoicePatches(params: {
   currentItems: ActionItem[];
   recentTranscript: string;
@@ -35,7 +39,6 @@ export async function generateVoicePatches(params: {
 }): Promise<PatchResponse> {
   const ai = getGeminiClient();
 
-  // Only send the fields Gemini needs to keep prompts small and fast
   const simplifiedItems = params.currentItems.map((item) => ({
     id: item.id,
     text: item.text,
@@ -49,21 +52,46 @@ export async function generateVoicePatches(params: {
     recentTranscript: params.recentTranscript,
   });
 
-  const response = await ai.models.generateContent({
-    model: "gemini-3.5-flash-lite",
-    contents: userMessage,
-    config: {
-      systemInstruction: SYSTEM_PROMPT,
-      temperature: 0.1,
-      responseMimeType: "application/json",
-      responseJsonSchema: z.toJSONSchema(PatchResponseSchema),
-    },
-  });
+  // Try fast lite model first, then retry or fall back to standard flash on 503/429 spikes
+  const modelsToTry = ["gemini-3.5-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash"];
 
-  if (!response.text) {
-    return { sessionTitle: null, operations: [] };
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const model = modelsToTry[i];
+
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: userMessage,
+        config: {
+          systemInstruction: SYSTEM_PROMPT,
+          temperature: 0.1,
+          responseMimeType: "application/json",
+          responseJsonSchema: z.toJSONSchema(PatchResponseSchema),
+        },
+      });
+
+      if (!response.text) {
+        return { sessionTitle: null, operations: [] };
+      }
+
+      const parsedJson = JSON.parse(response.text);
+      return PatchResponseSchema.parse(parsedJson);
+    } catch (error) {
+      const errorText = error instanceof Error ? error.message : String(error);
+      const isTemporarySpike =
+        errorText.includes("503") ||
+        errorText.includes("429") ||
+        errorText.includes("UNAVAILABLE");
+
+      // If it's a temporary spike and we still have retries left, wait briefly and try again
+      if (isTemporarySpike && i < modelsToTry.length - 1) {
+        await wait(600 * (i + 1));
+        continue;
+      }
+
+      throw error;
+    }
   }
 
-  const parsedJson = JSON.parse(response.text);
-  return PatchResponseSchema.parse(parsedJson);
+  return { sessionTitle: null, operations: [] };
 }
